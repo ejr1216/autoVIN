@@ -5,6 +5,6 @@
 
 fastapi==0.162.5
 httpx==0.28.1
-pydantic==2.13.5
+pydantic==2.14.3
 redis==8.1.0
 uvicorn==0.54.0
