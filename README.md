@@ -9,6 +9,13 @@ It includes API-key authentication, rate limiting (optionally shared across
 servers), automatic retries, JSON
 logging with request IDs, a health check, a Docker image and automated tests.
 
+> **HTTPS note:** started as shown below, the service uses plain HTTP, which is
+> fine on your own computer but not on a network: API keys would travel
+> unencrypted. Most hosting platforms add HTTPS for you. If yours does not,
+> you can give the service a certificate directly. See
+> [HTTPS with your own certificate](#https-with-your-own-certificate) for how
+> to create one and turn it on.
+
 ## Quick start
 
 You need Python 3.10 or newer.
@@ -114,9 +121,11 @@ docker run -p 8000:8000 -e API_KEYS="first-key,second-key" vin-decoder
 
 The image runs as an unprivileged user and has a built-in health check.
 
-**3. Put it behind HTTPS.** The service speaks plain HTTP. Run it behind a load
-balancer or reverse proxy that handles HTTPS, otherwise API keys travel
-unencrypted.
+**3. Use HTTPS.** Without it, API keys travel unencrypted. Either run the
+service behind a hosting platform, load balancer or reverse proxy that handles
+HTTPS (most cloud platforms do this automatically), or give the service a
+certificate directly as described in
+[HTTPS with your own certificate](#https-with-your-own-certificate).
 
 **4. Share the rate limit if you run more than one copy.** By default each
 copy of the service counts requests in its own memory, so three copies would
@@ -147,6 +156,89 @@ standard error, for example:
 API keys and query strings are never logged. The VIN is logged as part of the
 path; if your organization treats VINs as personal data, apply your usual log
 retention rules.
+
+## HTTPS with your own certificate
+
+The service can serve HTTPS itself if you give it two files: a certificate
+(`cert.pem`) and its private key (`key.pem`).
+
+**Keep the private key secret.** Anyone who has it can impersonate your
+service. Never commit it; `.gitignore` already excludes `*.pem` and `*.key`
+files. Restrict who can read it:
+
+```bash
+chmod 600 key.pem
+```
+
+### Step 1: create the certificate
+
+Pick the option that matches where the service will be used.
+
+**Option A: a public domain name (free, trusted everywhere).** If the service
+has a domain name such as `vin.example.com` pointing at your server, and port
+80 is reachable from the internet, [Let's Encrypt](https://letsencrypt.org/)
+issues a certificate that every client trusts. Install
+[Certbot](https://certbot.eff.org/) and run:
+
+```bash
+sudo certbot certonly --standalone -d vin.example.com
+```
+
+The files are written to `/etc/letsencrypt/live/vin.example.com/`. Use
+`fullchain.pem` as the certificate and `privkey.pem` as the key. These
+certificates last 90 days. Certbot renews them automatically, but the service
+must be restarted after each renewal to pick up the new one.
+
+**Option B: your company's certificate authority.** For a service on an
+internal network, ask whoever manages certificates in your organization for a
+certificate and key for the service's host name. Company devices usually
+already trust these.
+
+**Option C: a self-signed certificate (testing only).** This needs nothing but
+`openssl`, but nobody trusts the result automatically: every caller must be
+given `cert.pem` and told to trust it. Use it for testing or between machines
+you control. Replace `localhost` and `127.0.0.1` with the host name or IP
+address callers will use:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 365 -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+```
+
+It expires after 365 days; run the command again to replace it.
+
+### Step 2: start the service with the certificate
+
+Directly:
+
+```bash
+uvicorn vin_decoder:app --host 0.0.0.0 --port 8443 --no-access-log --ssl-keyfile key.pem --ssl-certfile cert.pem
+```
+
+Or with Docker, with the two files in a folder named `certs`:
+
+```bash
+docker run --no-healthcheck --user "$(id -u):$(id -g)" -p 8443:8443 -v "$PWD/certs:/certs:ro" -e API_KEYS="first-key" vin-decoder uvicorn vin_decoder:app --host 0.0.0.0 --port 8443 --no-access-log --ssl-keyfile /certs/key.pem --ssl-certfile /certs/cert.pem
+```
+
+- `--user` runs the container as you, so it can read your protected key file.
+- `--no-healthcheck` is needed because the image's built-in health check
+  expects plain HTTP on port 8000. Point your own monitoring at
+  `https://your-host:8443/health` instead.
+
+### Step 3: check it works
+
+```bash
+curl https://vin.example.com:8443/health
+```
+
+For a self-signed certificate, tell curl to trust it:
+
+```bash
+curl --cacert cert.pem https://localhost:8443/health
+```
+
+Both should print `{"status":"ok"}`. Plain `http://` requests to that port now
+fail, which is the intended result.
 
 ## Changing things
 
