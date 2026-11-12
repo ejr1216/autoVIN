@@ -336,13 +336,82 @@ def test_key_guessing_is_rate_limited(api, monkeypatch):
 
 def test_limit_resets_each_minute(monkeypatch):
     now = [0.0]
-    monkeypatch.setattr(vin_decoder.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(vin_decoder.time, "time", lambda: now[0])
     limiter = vin_decoder.RateLimiter()
 
     assert limiter.allow("caller", 1) is True
     assert limiter.allow("caller", 1) is False
     now[0] = 61.0
     assert limiter.allow("caller", 1) is True
+
+
+# --- Shared rate limit (Redis) ----------------------------------------------
+
+
+class FakeRedis:
+    """Stands in for a Redis server: counts in a dict that tests can share."""
+
+    def __init__(self, counts=None, broken=False):
+        self.counts = {} if counts is None else counts
+        self.broken = broken
+        self.expiries = {}
+        self._queued = []
+
+    def pipeline(self, transaction=True):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *error):
+        return False
+
+    def incr(self, key):
+        self._queued.append(key)
+
+    def expire(self, key, seconds):
+        self.expiries[key] = seconds
+
+    async def execute(self):
+        if self.broken:
+            raise vin_decoder.RedisError("connection refused")
+        key = self._queued.pop()
+        self.counts[key] = self.counts.get(key, 0) + 1
+        return [self.counts[key], True]
+
+    async def aclose(self):
+        pass
+
+
+def test_redis_limit_is_shared_between_copies(api, monkeypatch):
+    monkeypatch.setattr(vin_decoder, "RATE_LIMIT_PER_MINUTE", 2)
+    shared_counts = {}
+
+    # Two copies of the service, each with its own memory, one Redis.
+    vin_decoder.app.state.redis = FakeRedis(shared_counts)
+    assert api(VIN_URL, results()).status_code == 200
+    monkeypatch.setattr(vin_decoder, "rate_limiter", vin_decoder.RateLimiter())
+    vin_decoder.app.state.redis = FakeRedis(shared_counts)
+    assert api(VIN_URL, results()).status_code == 200
+    assert api(VIN_URL, results()).status_code == 429
+
+
+def test_redis_counters_expire(api, monkeypatch):
+    monkeypatch.setattr(vin_decoder, "RATE_LIMIT_PER_MINUTE", 2)
+    fake = FakeRedis()
+    vin_decoder.app.state.redis = fake
+
+    api(VIN_URL, results())
+
+    assert list(fake.expiries.values()) == [120]
+
+
+def test_redis_outage_falls_back_to_memory_limit(api, monkeypatch):
+    monkeypatch.setattr(vin_decoder, "RATE_LIMIT_PER_MINUTE", 1)
+    vin_decoder.app.state.redis = FakeRedis(broken=True)
+
+    assert api(VIN_URL, results()).status_code == 200  # still served
+    assert api(VIN_URL, results()).status_code == 429  # still limited
 
 
 # --- Health, request IDs, logging -------------------------------------------

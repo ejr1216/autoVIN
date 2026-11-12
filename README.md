@@ -5,7 +5,8 @@ into the vehicle's year, make, model, trim and body style. It looks the VIN up
 in the free, public [NHTSA vPIC](https://vpic.nhtsa.dot.gov/api/) service, so
 no NHTSA account or key is needed.
 
-It includes API-key authentication, rate limiting, automatic retries, JSON
+It includes API-key authentication, rate limiting (optionally shared across
+servers), automatic retries, JSON
 logging with request IDs, a health check, a Docker image and automated tests.
 
 ## Quick start
@@ -76,6 +77,7 @@ All settings are environment variables. None are required.
 | ----------------------- | ------------------------------------------ | ---------------------------------------------------------------------------- |
 | `API_KEYS`              | not set (open to anyone)                   | Comma-separated keys callers must send in `X-API-Key`.                        |
 | `RATE_LIMIT_PER_MINUTE` | `60`                                       | Requests allowed per caller per minute. `0` turns it off.                     |
+| `REDIS_URL`             | not set (count in memory)                  | Redis address for a rate limit shared by all copies of the service.           |
 | `NHTSA_MAX_RETRIES`     | `2`                                        | Extra attempts when NHTSA times out or returns 429/500/502/503/504.           |
 | `RETRY_BACKOFF_SECONDS` | `0.5`                                      | Wait before the first retry. It doubles for each later retry.                 |
 | `NHTSA_TIMEOUT_SECONDS` | `10`                                       | How long to wait for each NHTSA attempt.                                      |
@@ -116,10 +118,21 @@ The image runs as an unprivileged user and has a built-in health check.
 balancer or reverse proxy that handles HTTPS, otherwise API keys travel
 unencrypted.
 
-**4. Know the limits of the built-in rate limiter.**
+**4. Share the rate limit if you run more than one copy.** By default each
+copy of the service counts requests in its own memory, so three copies would
+allow three times the limit. To make all copies share one count, point them at
+the same [Redis](https://redis.io/) server:
 
-- Counts are kept in memory per process. If you run several copies, each has
-  its own count, so set a shared limit at your gateway or load balancer too.
+```bash
+docker run -p 8000:8000 -e API_KEYS="first-key" -e REDIS_URL="rediss://:password@your-redis-host:6379/0" vin-decoder
+```
+
+- `REDIS_URL` contains the Redis password, so treat it as a secret like
+  `API_KEYS`. Use `rediss://` (two s's) so the connection is encrypted.
+- If Redis cannot be reached, the service keeps working and falls back to the
+  in-memory count until Redis returns. A warning is logged each time.
+- The service stores only short-lived counters in Redis, which delete
+  themselves after two minutes.
 - Callers without a valid key are counted by IP address. Behind a proxy, every
   caller appears to come from the proxy's address unless you tell uvicorn to
   trust it by setting `FORWARDED_ALLOW_IPS` to the proxy's IP address.
@@ -208,5 +221,10 @@ and run the tests.
   rate limit.
 - The project stores no secrets. Keep keys in environment variables and never
   commit them. `.gitignore` already excludes `.env` files.
-- Not included: caching of NHTSA results, metrics and tracing, and a rate limit
-  shared across multiple servers.
+- Not included: caching of NHTSA results, and metrics and tracing.
+
+## License
+
+Released under the [Apache License 2.0](LICENSE). You may use, change and
+redistribute this code, including commercially, as long as you keep the
+license notice. It comes with no warranty.

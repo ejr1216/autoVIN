@@ -19,10 +19,12 @@ from contextvars import ContextVar
 from typing import Annotated, Any
 
 import httpx
+import redis.asyncio as redis_client
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
+from redis.exceptions import RedisError
 
 # --------------------------------------------------------------------------
 # Settings. Everything you are likely to change lives in this block.
@@ -39,6 +41,12 @@ API_KEYS = frozenset(key.strip() for key in os.getenv("API_KEYS", "").split(",")
 # Requests allowed per caller per minute. A caller is an API key, or an IP
 # address when no valid key is sent. 0 turns rate limiting off.
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+
+# Address of a Redis server, for example REDIS_URL="rediss://:password@host:6379/0".
+# Set it when you run more than one copy of this service, so that all copies
+# share one request count per caller. Leave unset to count in memory (fine
+# for a single copy). The address can contain a password: never write it here.
+REDIS_URL = os.getenv("REDIS_URL", "")
 
 # --- NHTSA connection ---
 NHTSA_BASE_URL = os.getenv("NHTSA_BASE_URL", "https://vpic.nhtsa.dot.gov/api/vehicles/")
@@ -129,6 +137,12 @@ if not logger.handlers:
 async def lifespan(app: FastAPI):
     if not API_KEYS:
         logger.warning("API_KEYS is not set: the API accepts requests from anyone.")
+    # Short timeouts so a Redis outage slows requests by a second at most.
+    app.state.redis = (
+        redis_client.from_url(REDIS_URL, socket_timeout=1, socket_connect_timeout=1)
+        if REDIS_URL
+        else None
+    )
     # One shared client for the whole app, so connections are reused.
     async with httpx.AsyncClient(
         base_url=NHTSA_BASE_URL,
@@ -137,9 +151,11 @@ async def lifespan(app: FastAPI):
     ) as client:
         app.state.nhtsa_client = client
         yield
+    if app.state.redis is not None:
+        await app.state.redis.aclose()
 
 
-app = FastAPI(title="VIN Decoder API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="VIN Decoder API", version="2.1.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -177,11 +193,10 @@ async def request_context(request: Request, call_next):
 
 
 class RateLimiter:
-    """Counts requests per caller in the current minute.
+    """Counts requests per caller in the current minute, in memory.
 
-    Counts are kept in memory, so each server process has its own. If you run
-    several processes or servers, the effective limit is multiplied; enforce a
-    shared limit at your gateway or load balancer in that case.
+    Each server process has its own counts. It is used when REDIS_URL is not
+    set, and as a fallback when Redis cannot be reached.
     """
 
     def __init__(self) -> None:
@@ -189,7 +204,7 @@ class RateLimiter:
         self._counts: dict[str, int] = {}
 
     def allow(self, caller: str, limit: int) -> bool:
-        minute = int(time.monotonic() // 60)
+        minute = int(time.time() // 60)
         if minute != self._minute:
             self._minute, self._counts = minute, {}
         self._counts[caller] = self._counts.get(caller, 0) + 1
@@ -197,6 +212,28 @@ class RateLimiter:
 
 
 rate_limiter = RateLimiter()
+
+
+async def within_rate_limit(request: Request, caller: str, limit: int) -> bool:
+    """Count this request and say whether the caller is still within the limit."""
+    shared_store = getattr(request.app.state, "redis", None)
+    if shared_store is not None:
+        try:
+            # One counter per caller per minute, shared by every copy of the service.
+            key = f"vin-decoder:rate:{int(time.time() // 60)}:{caller}"
+            async with shared_store.pipeline(transaction=True) as pipe:
+                pipe.incr(key)
+                pipe.expire(key, 120)  # Redis deletes old counters by itself
+                count, _ = await pipe.execute()
+            return count <= limit
+        except (RedisError, OSError) as error:
+            # Keep serving, with this process's own count, rather than fail.
+            # Only the error type is logged: the message can contain the address.
+            logger.warning(
+                "Redis unavailable (%s); using the in-memory rate limit.", type(error).__name__
+            )
+    return rate_limiter.allow(caller, limit)
+
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
@@ -214,8 +251,10 @@ async def protect(
         caller = "ip:" + (request.client.host if request.client else "unknown")
 
     # Rate limit first, so guessing API keys is throttled too.
-    if RATE_LIMIT_PER_MINUTE > 0 and not rate_limiter.allow(caller, RATE_LIMIT_PER_MINUTE):
-        seconds_left = 60 - int(time.monotonic() % 60)
+    if RATE_LIMIT_PER_MINUTE > 0 and not await within_rate_limit(
+        request, caller, RATE_LIMIT_PER_MINUTE
+    ):
+        seconds_left = 60 - int(time.time() % 60)
         raise HTTPException(
             status_code=429,
             detail="Too many requests. Try again shortly.",
