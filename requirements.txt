@@ -1,11 +1,10 @@
+# What the service needs to run.
 # Install with: pip install -r requirements.txt
 # To update: change a version here, reinstall, then run `pytest`.
+# (Dependabot opens pull requests for new versions automatically.)
 
-# Runtime
 fastapi==0.162.5
 httpx==0.28.1
 pydantic==2.13.5
+redis==8.1.0
 uvicorn==0.54.0
-
-# Tests
-pytest==9.2.0
