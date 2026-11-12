@@ -1,28 +1,60 @@
 """VIN Decoder API: a thin wrapper around the NHTSA vPIC VIN decoder.
 
 Run:   uvicorn vin_decoder:app
-Try:   GET /vin/1HGCM82633A004352
+Try:   GET /v1/vin/1HGCM82633A004352
 Docs:  GET /docs
 """
 
+import asyncio
+import hashlib
+import hmac
+import json
 import logging
 import os
 import re
+import time
+import uuid
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import Annotated, Any
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 
 # --------------------------------------------------------------------------
 # Settings. Everything you are likely to change lives in this block.
-# The first two can be overridden with environment variables.
+# Anything read with os.getenv can be set as an environment variable.
 # --------------------------------------------------------------------------
+
+# --- Access control ---
+# Comma-separated list of API keys callers must send in the X-API-Key header,
+# for example API_KEYS="key-for-team-a,key-for-team-b". Leave unset to allow
+# anyone (only do that behind a gateway that already authenticates callers).
+# Never write real keys in this file.
+API_KEYS = frozenset(key.strip() for key in os.getenv("API_KEYS", "").split(",") if key.strip())
+
+# Requests allowed per caller per minute. A caller is an API key, or an IP
+# address when no valid key is sent. 0 turns rate limiting off.
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+
+# --- NHTSA connection ---
 NHTSA_BASE_URL = os.getenv("NHTSA_BASE_URL", "https://vpic.nhtsa.dot.gov/api/vehicles/")
 NHTSA_TIMEOUT_SECONDS = float(os.getenv("NHTSA_TIMEOUT_SECONDS", "10"))
 
+# How many extra attempts to make when NHTSA times out, drops the connection
+# or answers with one of RETRY_STATUS_CODES. 0 turns retries off.
+NHTSA_MAX_RETRIES = int(os.getenv("NHTSA_MAX_RETRIES", "2"))
+# Wait before the first retry; the wait doubles for each later retry.
+RETRY_BACKOFF_SECONDS = float(os.getenv("RETRY_BACKOFF_SECONDS", "0.5"))
+RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+
+# --- Logging ---
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# --- VIN rules ---
 # 17 characters, no I, O or Q (they are not allowed in a VIN).
 VIN_PATTERN = re.compile(r"[A-HJ-NPR-Z0-9]{17}")
 
@@ -36,6 +68,7 @@ MAX_MODEL_YEAR = 2100
 # accept them. Full list: https://vpic.nhtsa.dot.gov/api/ (ErrorCode variable).
 ACCEPTED_ERROR_CODES = {"0"}
 
+# --- Response fields ---
 # Optional response fields: our field name -> NHTSA field name.
 # To expose another NHTSA value, add a line here and a matching
 # `name: str | None = None` field on VehicleDetails below.
@@ -44,8 +77,6 @@ OPTIONAL_FIELDS = {
     "body_style": "BodyClass",
 }
 # --------------------------------------------------------------------------
-
-logger = logging.getLogger("vin_decoder")
 
 
 class VehicleDetails(BaseModel):
@@ -60,8 +91,44 @@ class VehicleDetails(BaseModel):
     body_style: str | None = None
 
 
+# --- Logging: one JSON object per line, tagged with the request ID ----------
+
+request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
+
+# Request IDs supplied by callers are only trusted if they look harmless.
+REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+class JsonLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "time": self.formatTime(record),
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "request_id": request_id_var.get(),
+            **getattr(record, "fields", {}),
+        }
+        if record.exc_info:
+            entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(entry)
+
+
+logger = logging.getLogger("vin_decoder")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(JsonLogFormatter())
+    logger.addHandler(_handler)
+    logger.setLevel(LOG_LEVEL)
+    logger.propagate = False
+
+
+# --- App setup --------------------------------------------------------------
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not API_KEYS:
+        logger.warning("API_KEYS is not set: the API accepts requests from anyone.")
     # One shared client for the whole app, so connections are reused.
     async with httpx.AsyncClient(
         base_url=NHTSA_BASE_URL,
@@ -72,7 +139,94 @@ async def lifespan(app: FastAPI):
         yield
 
 
-app = FastAPI(title="VIN Decoder API", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="VIN Decoder API", version="2.0.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def request_context(request: Request, call_next):
+    """Give every request an ID, log it, and add safe default headers."""
+    supplied = request.headers.get("X-Request-ID", "")
+    request_id = supplied if REQUEST_ID_PATTERN.fullmatch(supplied) else uuid.uuid4().hex
+    request_id_var.set(request_id)
+
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("Unhandled error", extra={"fields": {"path": request.url.path}})
+        raise
+
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    # Query strings and headers are deliberately not logged (they can hold keys).
+    logger.info(
+        "request",
+        extra={
+            "fields": {
+                "method": request.method,
+                "path": request.url.path,
+                "status": response.status_code,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+            }
+        },
+    )
+    return response
+
+
+# --- Access control: API keys and rate limiting -----------------------------
+
+
+class RateLimiter:
+    """Counts requests per caller in the current minute.
+
+    Counts are kept in memory, so each server process has its own. If you run
+    several processes or servers, the effective limit is multiplied; enforce a
+    shared limit at your gateway or load balancer in that case.
+    """
+
+    def __init__(self) -> None:
+        self._minute = 0
+        self._counts: dict[str, int] = {}
+
+    def allow(self, caller: str, limit: int) -> bool:
+        minute = int(time.monotonic() // 60)
+        if minute != self._minute:
+            self._minute, self._counts = minute, {}
+        self._counts[caller] = self._counts.get(caller, 0) + 1
+        return self._counts[caller] <= limit
+
+
+rate_limiter = RateLimiter()
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def protect(
+    request: Request,
+    api_key: Annotated[str | None, Depends(api_key_header)],
+) -> None:
+    """Enforce the rate limit, then the API key (when API_KEYS is set)."""
+    key_is_valid = api_key is not None and any(
+        hmac.compare_digest(api_key.encode(), known.encode()) for known in API_KEYS
+    )
+    if key_is_valid:
+        caller = "key:" + hashlib.sha256(api_key.encode()).hexdigest()[:16]
+    else:
+        caller = "ip:" + (request.client.host if request.client else "unknown")
+
+    # Rate limit first, so guessing API keys is throttled too.
+    if RATE_LIMIT_PER_MINUTE > 0 and not rate_limiter.allow(caller, RATE_LIMIT_PER_MINUTE):
+        seconds_left = 60 - int(time.monotonic() % 60)
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests. Try again shortly.",
+            headers={"Retry-After": str(seconds_left)},
+        )
+
+    if API_KEYS and not key_is_valid:
+        raise HTTPException(status_code=401, detail="Missing or invalid API key.")
+
+
+# --- VIN decoding -----------------------------------------------------------
 
 
 def get_nhtsa_client(request: Request) -> httpx.AsyncClient:
@@ -90,21 +244,42 @@ def normalize_vin(vin: str) -> str:
 async def fetch_nhtsa_record(
     client: httpx.AsyncClient, vin: str, model_year: int | None
 ) -> dict[str, Any]:
-    """Call NHTSA and return the single result record, or raise 502."""
+    """Call NHTSA (retrying temporary failures) and return its record, or raise 502."""
     params = {"format": "json"}
     if model_year is not None:
         params["modelyear"] = str(model_year)
 
+    unavailable = HTTPException(status_code=502, detail="NHTSA VIN service is unavailable.")
+    attempts = NHTSA_MAX_RETRIES + 1
+    response = None
+
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            await asyncio.sleep(RETRY_BACKOFF_SECONDS * 2 ** (attempt - 2))
+        try:
+            # `vin` has already passed VIN_PATTERN, so it is safe to put in the path.
+            response = await client.get(f"DecodeVinValues/{vin}", params=params)
+        except httpx.TransportError as error:  # timeouts and connection problems
+            problem = repr(error)
+        except httpx.HTTPError as error:  # anything else is not worth retrying
+            logger.warning("NHTSA request failed: %r", error)
+            raise unavailable from error
+        else:
+            if response.status_code not in RETRY_STATUS_CODES:
+                break
+            problem = f"HTTP {response.status_code}"
+        logger.warning("NHTSA attempt %d of %d failed: %s", attempt, attempts, problem)
+    else:
+        raise unavailable
+
+    if response.status_code != 200:
+        logger.warning("NHTSA answered with HTTP %d", response.status_code)
+        raise unavailable
+
     try:
-        # `vin` has already passed VIN_PATTERN, so it is safe to put in the path.
-        response = await client.get(f"DecodeVinValues/{vin}", params=params)
-        response.raise_for_status()
         record = response.json()["Results"][0]
         if not isinstance(record, dict):
             raise TypeError("unexpected result shape")
-    except httpx.HTTPError as error:
-        logger.warning("NHTSA request failed: %r", error)
-        raise HTTPException(status_code=502, detail="NHTSA VIN service is unavailable.") from error
     except (ValueError, KeyError, IndexError, TypeError) as error:
         logger.warning("NHTSA returned an unexpected response: %r", error)
         raise HTTPException(status_code=502, detail="NHTSA returned no decoding data.") from error
@@ -129,12 +304,21 @@ def build_vehicle_details(vin: str, record: dict[str, Any]) -> VehicleDetails:
     return VehicleDetails(vin=vin, model_year=int(year), make=make, model=model, **optional)
 
 
-@app.get(
+# --- Routes -----------------------------------------------------------------
+
+# Everything under /v1 requires `protect`. For a breaking change, add a /v2
+# router next to this one and leave /v1 working for existing callers.
+v1 = APIRouter(prefix="/v1", dependencies=[Depends(protect)])
+
+
+@v1.get(
     "/vin/{vin}",
     response_model=VehicleDetails,
     responses={
         400: {"description": "VIN is not 17 valid characters."},
+        401: {"description": "Missing or invalid API key."},
         422: {"description": "VIN could not be decoded."},
+        429: {"description": "Rate limit exceeded."},
         502: {"description": "NHTSA service failed or returned bad data."},
     },
 )
@@ -148,3 +332,12 @@ async def decode_vin(
     vin_value = normalize_vin(vin)
     record = await fetch_nhtsa_record(client, vin_value, model_year)
     return build_vehicle_details(vin_value, record)
+
+
+app.include_router(v1)
+
+
+@app.get("/health", tags=["operations"])
+async def health() -> dict[str, str]:
+    """Liveness check for load balancers. Needs no API key and never calls NHTSA."""
+    return {"status": "ok"}

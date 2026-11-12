@@ -1,0 +1,4 @@
+# Only requirements.txt and vin_decoder.py are needed in the image.
+*
+!requirements.txt
+!vin_decoder.py
